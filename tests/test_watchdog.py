@@ -135,3 +135,123 @@ class TestCLI(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMainEndToEnd(unittest.TestCase):
+    """Drive watchdog.main() itself: simulate -> write JSONL -> main(argv)
+    -> findings + dashboard. Fully deterministic (simulate(seed=123); the
+    detection path uses no unseeded randomness)."""
+
+    SEED = 123
+    N_BASE = 60
+
+    def crafted_anomalies(self, base_entries, baseline):
+        active = set(baseline["active_hours"])
+        hour = min(active)  # a guaranteed-active hour for the pinned ts
+        stamp = "2026-10-16T%02d:05:00" % hour
+        expected = []
+
+        def entry(**kw):
+            e = {"ts": stamp, "agent": "home-assistant",
+                 "action": "lights.turn_on", "tool": "hue.lights",
+                 "details": "turned on living room lights", "spend_usd": 0.0}
+            e.update(kw)
+            return e
+
+        anomalies = []
+        # new-tool: unknown tool, otherwise completely benign
+        anomalies.append(entry(tool="shell.exec", action="run.command",
+                              details="ran a diagnostic command"))
+        expected.append("new-tool")
+        # unusual-hour: known tool at an hour absent from the baseline
+        odd = next((h for h in range(24) if h not in active), None)
+        if odd is not None:
+            anomalies.append(entry(ts="2026-10-16T%02d:14:00" % odd))
+            expected.append("unusual-hour")
+        # spend-spike: real baseline entry (known tool/action/hour),
+        # spend far above the per-action threshold
+        e0 = dict(base_entries[0])
+        threshold = baseline["spend_max"].get(e0["action"], 0.0)
+        e0["ts"] = stamp
+        e0["spend_usd"] = max(threshold * 2.0, 50.0) + 100.0
+        anomalies.append(e0)
+        expected.append("spend-spike")
+        # new-domain: real baseline entry with a never-seen domain
+        d0 = dict(base_entries[1])
+        d0["ts"] = stamp
+        d0["details"] = "uploaded backup to evil-exfil.net/vault"
+        anomalies.append(d0)
+        expected.append("new-domain")
+        return anomalies, expected
+
+    def test_main_full_pipeline(self):
+        sim = watchdog.simulate(120, seed=self.SEED)
+        base_entries = sim[:self.N_BASE]
+        baseline = watchdog.learn_baseline(base_entries)
+        anomalies, expected_rules = self.crafted_anomalies(base_entries,
+                                                           baseline)
+        log_entries = sim + anomalies
+
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "activity.jsonl")
+            dash = os.path.join(d, "dashboard.html")
+            findings_path = os.path.join(d, "findings.jsonl")
+            watchdog.write_jsonl(log_entries, log)
+
+            rc = watchdog.main(["--log", log,
+                                "--dashboard", dash,
+                                "--findings", findings_path,
+                                "--baseline", str(self.N_BASE)])
+            self.assertEqual(rc, 0)
+
+            # findings file produced and parseable
+            self.assertTrue(os.path.exists(findings_path),
+                            "findings.jsonl not produced")
+            rules = set()
+            with open(findings_path, encoding="utf-8") as fh:
+                lines = [ln for ln in fh if ln.strip()]
+            self.assertGreaterEqual(len(lines), len(expected_rules))
+            for ln in lines:
+                obj = json.loads(ln)  # must be valid JSON per line
+                rules.add(obj["rule"])
+            for rule in expected_rules:
+                self.assertIn(rule, rules,
+                              f"expected rule {rule} missing from {sorted(rules)}")
+
+            # dashboard produced with the findings surfaced
+            self.assertTrue(os.path.exists(dash), "dashboard not produced")
+            with open(dash, encoding="utf-8") as fh:
+                page = fh.read()
+            self.assertIn("home-agent-watchdog", page)
+            for rule in expected_rules:
+                self.assertIn(rule, page,
+                              f"rule {rule} missing from dashboard")
+
+    def test_main_deterministic_same_seed(self):
+        # Two identical runs must yield identical finding rules and counts.
+        def one_run():
+            with tempfile.TemporaryDirectory() as d:
+                log = os.path.join(d, "a.jsonl")
+                dash = os.path.join(d, "d.html")
+                fp = os.path.join(d, "f.jsonl")
+                sim = watchdog.simulate(120, seed=self.SEED)
+                base = sim[:self.N_BASE]
+                baseline = watchdog.learn_baseline(base)
+                anomalies, _ = self.crafted_anomalies(base, baseline)
+                watchdog.write_jsonl(sim + anomalies, log)
+                self.assertEqual(
+                    watchdog.main(["--log", log, "--dashboard", dash,
+                                   "--findings", fp,
+                                   "--baseline", str(self.N_BASE)]), 0)
+                rules = []
+                with open(fp, encoding="utf-8") as fh:
+                    for ln in fh:
+                        if ln.strip():
+                            rules.append(json.loads(ln)["rule"])
+                return sorted(rules)
+
+        self.assertEqual(one_run(), one_run())
+
+
+if __name__ == "__main__":
+    unittest.main()

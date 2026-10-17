@@ -80,9 +80,11 @@ activity below, with an "all / flagged only" filter.
 
 ```bash
 python3 -m unittest discover -s tests
-# 9 tests — simulator schema + JSONL round-trip, each of the 4 rules firing
+# 11 tests — simulator schema + JSONL round-trip, each of the 4 rules firing
 # on crafted fixtures and staying quiet on benign ones, dashboard generation
-# (no CDN/remote refs), and a full CLI end-to-end run
+# (no CDN/remote refs), a full CLI end-to-end run, a main() end-to-end run
+# (simulate -> write JSONL -> main(argv) -> findings + dashboard asserted),
+# and a determinism check (same seed -> identical findings)
 ```
 
 ## License
